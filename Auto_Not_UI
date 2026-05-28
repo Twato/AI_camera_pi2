@@ -1,0 +1,366 @@
+from picamera2 import Picamera2, Preview
+from time import sleep, time
+from datetime import datetime
+import os
+import threading
+import cv2
+import numpy as np
+import tkinter as tk
+
+SAVE_DIR = "captures"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+PREVIEW_SIZE = (300, 240)
+CAPTURE_SIZE = (1280, 720)
+
+MOTION_THRESHOLD = 120000
+STABLE_THRESHOLD = 70000
+
+FOCUS_DELAY = 7
+REMOVE_DELAY = 5
+STABLE_TIME = 2
+
+SHOW_PREVIEW = True
+
+running = False
+current_camera = None
+
+
+def set_status(text):
+    status_label.config(text=text)
+    root.update_idletasks()
+    print(text)
+
+
+def make_folder(name):
+    folder = os.path.join(SAVE_DIR, name)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def filename(camera_name):
+    folder = make_folder(camera_name)
+    name = datetime.now().strftime(f"{camera_name}_%Y%m%d_%H%M%S.jpg")
+    return os.path.join(folder, name)
+
+
+def gray_from_frame(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (21, 21), 0)
+    return gray
+
+
+def motion_score(bg, current):
+    diff = cv2.absdiff(bg, current)
+    _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+    return np.sum(thresh)
+
+
+def wait_stable_picam(cam):
+    stable_start = None
+    prev = None
+
+    while running:
+        gray = gray_from_frame(cam.capture_array())
+
+        if prev is None:
+            prev = gray
+            sleep(1)
+            continue
+
+        score = motion_score(prev, gray)
+
+        if score < STABLE_THRESHOLD:
+            if stable_start is None:
+                stable_start = time()
+
+            if time() - stable_start >= STABLE_TIME:
+                return gray
+        else:
+            stable_start = None
+
+        prev = gray
+        sleep(1)
+
+    return None
+
+
+def run_picamera(camera_index, camera_name):
+    global current_camera
+
+    cam = None
+
+    try:
+        set_status(f"{camera_name}: Opening Camera")
+
+        cam = Picamera2(camera_index)
+        current_camera = cam
+
+        config = cam.create_preview_configuration(
+            main={"size": PREVIEW_SIZE}
+        )
+        cam.configure(config)
+
+        if SHOW_PREVIEW:
+            cam.start_preview(Preview.QT)
+
+        cam.start()
+        sleep(1)
+
+        cam.set_controls({
+            "AfMode": 2,
+            "AfTrigger": 0
+        })
+
+        set_status(f"{camera_name}: Loading Background")
+        bg = wait_stable_picam(cam)
+
+        if bg is None:
+            return
+
+        set_status(f"{camera_name}: Ready / Waiting Object")
+
+        while running:
+            gray = gray_from_frame(cam.capture_array())
+            score = motion_score(bg, gray)
+
+            if score > MOTION_THRESHOLD:
+                set_status(f"{camera_name}: Object Detected")
+                sleep(1)
+
+                set_status(f"{camera_name}: Auto Focus {FOCUS_DELAY} sec")
+                cam.set_controls({
+                    "AfMode": 1,
+                    "AfTrigger": 0
+                })
+                sleep(FOCUS_DELAY)
+
+                filepath = filename(camera_name)
+
+                set_status(f"{camera_name}: Capturing")
+
+                cam.switch_mode_and_capture_file(
+                    cam.create_still_configuration(
+                        main={"size": CAPTURE_SIZE}
+                    ),
+                    filepath
+                )
+
+                print("Saved:", filepath)
+                set_status(f"{camera_name}: Saved Image")
+
+                set_status(f"{camera_name}: Remove Object {REMOVE_DELAY} sec")
+                sleep(REMOVE_DELAY)
+
+                break
+
+            sleep(1)
+
+    except Exception as e:
+        print(f"{camera_name} Error:", e)
+        set_status(f"{camera_name}: Error")
+
+    finally:
+        try:
+            if cam is not None:
+                if SHOW_PREVIEW:
+                    cam.stop_preview()
+                cam.stop()
+                cam.close()
+        except Exception as e:
+            print("Close camera error:", e)
+
+        current_camera = None
+        set_status(f"{camera_name}: Closed")
+        sleep(2)
+
+
+def wait_stable_usb(cap):
+    stable_start = None
+    prev = None
+
+    while running:
+        ret, frame = cap.read()
+
+        if not ret:
+            sleep(1)
+            continue
+
+        gray = gray_from_frame(frame)
+
+        if prev is None:
+            prev = gray
+            sleep(1)
+            continue
+
+        score = motion_score(prev, gray)
+
+        if score < STABLE_THRESHOLD:
+            if stable_start is None:
+                stable_start = time()
+
+            if time() - stable_start >= STABLE_TIME:
+                return gray
+        else:
+            stable_start = None
+
+        prev = gray
+        sleep(1)
+
+    return None
+
+
+def run_usb_camera(device_index, camera_name):
+    cap = None
+
+    try:
+        set_status(f"{camera_name}: Opening USB Camera")
+
+        cap = cv2.VideoCapture(f"/dev/video{device_index}", cv2.CAP_V4L2)
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+
+        if not cap.isOpened():
+            set_status(f"{camera_name}: Cannot Open USB Camera")
+            return
+
+        sleep(1)
+
+        set_status(f"{camera_name}: Loading Background")
+
+        bg = None
+        for _ in range(20):
+            ret, frame = cap.read()
+            if ret:
+                bg = gray_from_frame(frame)
+                break
+            sleep(1)
+
+        if bg is None:
+            set_status(f"{camera_name}: Cannot Load Background")
+            return
+
+        set_status(f"{camera_name}: Ready / Waiting Object")
+
+        while running:
+            ret, frame = cap.read()
+
+            if not ret:
+                set_status(f"{camera_name}: Cannot Read Frame")
+                sleep(1)
+                continue
+
+            cv2.imshow("USB Camera Preview", frame)
+            cv2.waitKey(1)
+
+            gray = gray_from_frame(frame)
+            score = motion_score(bg, gray)
+
+            if score > MOTION_THRESHOLD:
+                set_status(f"{camera_name}: Object Detected")
+                sleep(1)
+
+                set_status(f"{camera_name}: Hold {FOCUS_DELAY} sec")
+                sleep(FOCUS_DELAY)
+
+                ret, frame = cap.read()
+
+                if ret:
+                    filepath = filename(camera_name)
+                    cv2.imwrite(filepath, frame)
+                    print("Saved:", filepath)
+                    set_status(f"{camera_name}: Saved Image")
+
+                set_status(f"{camera_name}: Remove Object {REMOVE_DELAY} sec")
+                sleep(REMOVE_DELAY)
+
+                break
+
+            sleep(1)
+
+    except Exception as e:
+        print(f"{camera_name} Error:", e)
+
+    finally:
+        if cap is not None:
+            cap.release()
+
+        cv2.destroyAllWindows()
+        set_status(f"{camera_name}: Closed")
+        sleep(2)
+
+
+def sequence_loop():
+    while running:
+        run_picamera(0, "cam0_bag")
+
+        if not running:
+            break
+
+        run_picamera(1, "cam1_box")
+
+        if not running:
+            break
+
+        run_usb_camera(0, "usb_carton")
+
+        if not running:
+            break
+
+    set_status("Status: Sequence Stopped")
+
+
+def start_sequence():
+    global running
+
+    if running:
+        return
+
+    running = True
+    set_status("Status: Sequence Started")
+
+    thread = threading.Thread(target=sequence_loop, daemon=True)
+    thread.start()
+
+def stop_sequence():
+    global running, current_camera
+
+    running = False
+
+    try:
+        if current_camera is not None:
+            if SHOW_PREVIEW:
+                current_camera.stop_preview()
+            current_camera.stop()
+            current_camera.close()
+    except:
+        pass
+
+    set_status("Status: Stop Requested")
+
+
+def on_close():
+    stop_sequence()
+    root.destroy()
+
+
+root = tk.Tk()
+root.title("Sequential Camera Data Collection")
+root.geometry("480x260")
+
+title = tk.Label(root, text="Sequential Camera Data Collection", font=("Arial", 16, "bold"))
+title.pack(pady=15)
+
+status_label = tk.Label(root, text="Status: Idle", font=("Arial", 12))
+status_label.pack(pady=15)
+
+btn_start = tk.Button(root, text="Start Sequence", font=("Arial", 14), width=22, command=start_sequence)
+btn_start.pack(pady=8)
+
+btn_stop = tk.Button(root, text="Stop Sequence", font=("Arial", 14), width=22, command=stop_sequence)
+btn_stop.pack(pady=8)
+
+root.protocol("WM_DELETE_WINDOW", on_close)
+root.mainloop()
